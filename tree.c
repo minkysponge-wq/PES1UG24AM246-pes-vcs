@@ -4,7 +4,7 @@
 // TODO functions:     tree_from_index
 //
 // Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
+//   "<mode-as-ascii-octal> <n>\0<32-byte-binary-hash>"
 //
 // Example single entry (conceptual):
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
@@ -15,6 +15,10 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <inttypes.h>
+
+// Forward declaration (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -116,22 +120,134 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
+// A lightweight local version of an index entry for tree building.
+// We read the .pes/index file directly here so tree.c doesn't depend on index.c.
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    char path[512];
+} LocalIndexEntry;
+
+#define LOCAL_MAX 10000
+
+// Read the index file into a local array (no dependency on index.c).
+static int load_index_local(LocalIndexEntry *entries, int *count_out) {
+    *count_out = 0;
+    FILE *f = fopen(".pes/index", "r");
+    if (!f) return 0; // empty index is fine
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (*count_out >= LOCAL_MAX) break;
+
+        LocalIndexEntry *e = &entries[*count_out];
+        unsigned int mode;
+        char hex[HASH_HEX_SIZE + 1];
+        uint64_t mtime;
+        uint32_t size;
+        char path[512];
+
+        int n = sscanf(line, "%o %64s %" SCNu64 " %u %511[^\n]",
+                       &mode, hex, &mtime, &size, path);
+        if (n != 5) continue;
+
+        e->mode = mode;
+        if (hex_to_hash(hex, &e->hash) != 0) continue;
+        snprintf(e->path, sizeof(e->path), "%s", path);
+
+        (*count_out)++;
+    }
+    fclose(f);
+    return 0;
+}
+
+// Recursive helper: builds a tree from index entries at a given path prefix.
+static int build_tree_recursive(const LocalIndexEntry *entries, int entry_count,
+                                const char *prefix, size_t prefix_len,
+                                ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    // Track which subdirectories we've already added
+    char seen_dirs[MAX_TREE_ENTRIES][256];
+    int seen_dir_count = 0;
+
+    for (int i = 0; i < entry_count; i++) {
+        const LocalIndexEntry *e = &entries[i];
+
+        // Skip entries that don't belong under this prefix
+        if (prefix_len > 0 && strncmp(e->path, prefix, prefix_len) != 0) continue;
+
+        const char *rest = e->path + prefix_len;
+        if (*rest == '\0') continue;
+
+        const char *slash = strchr(rest, '/');
+
+        if (slash == NULL) {
+            // Direct file in this directory
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = e->mode;
+            te->hash = e->hash;
+            snprintf(te->name, sizeof(te->name), "%s", rest);
+        } else {
+            // File inside a subdirectory
+            size_t dir_name_len = slash - rest;
+            if (dir_name_len >= 256) return -1;
+
+            char dir_name[256];
+            memcpy(dir_name, rest, dir_name_len);
+            dir_name[dir_name_len] = '\0';
+
+            // Already processed?
+            int already_seen = 0;
+            for (int j = 0; j < seen_dir_count; j++) {
+                if (strcmp(seen_dirs[j], dir_name) == 0) {
+                    already_seen = 1;
+                    break;
+                }
+            }
+            if (already_seen) continue;
+
+            snprintf(seen_dirs[seen_dir_count++], 256, "%s", dir_name);
+
+            // Build new prefix for the recursive call
+            char new_prefix[1024];
+            snprintf(new_prefix, sizeof(new_prefix), "%.*s%s/",
+                     (int)prefix_len, prefix, dir_name);
+
+            // Recurse
+            ObjectID sub_id;
+            if (build_tree_recursive(entries, entry_count,
+                                     new_prefix, strlen(new_prefix),
+                                     &sub_id) != 0) {
+                return -1;
+            }
+
+            // Add the subtree entry
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = MODE_DIR;
+            te->hash = sub_id;
+            snprintf(te->name, sizeof(te->name), "%s", dir_name);
+        }
+    }
+
+    // Serialize and write this tree
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
+}
+
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    static LocalIndexEntry entries[LOCAL_MAX];
+    int count = 0;
+    if (load_index_local(entries, &count) != 0) return -1;
+    return build_tree_recursive(entries, count, "", 0, id_out);
 }
